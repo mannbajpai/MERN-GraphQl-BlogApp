@@ -10,7 +10,7 @@ import { BlogType, CommentType, UserType } from "../schema/schema";
 import User from "../models/User";
 import Blog from "../models/Blog";
 import Comment from "../models/Comment";
-import { Document } from "mongoose";
+import { Document, Types, startSession } from "mongoose";
 import { compareSync, hashSync } from "bcryptjs";
 
 const RootQuery = new GraphQLObjectType({
@@ -96,14 +96,24 @@ const mutations = new GraphQLObjectType({
         title: { type: GraphQLNonNull(GraphQLString) },
         content: { type: GraphQLNonNull(GraphQLString) },
         date: { type: GraphQLNonNull(GraphQLString) },
+        user: { type: GraphQLNonNull(GraphQLID) },
       },
-      async resolve(parent, { title, content, date }) {
-        let blog: Document<any, any, any>;
+      async resolve(parent, { title, content, date, user }) {
+        let blog: Document<any, any, any> ;
+        const session = await startSession();
         try {
-          blog = new Blog({ title, content, date });
-          return await blog.save();
+          session.startTransaction({ session });
+          blog = new Blog({ title, content, date, user });
+          const existingUser = await User.findById(user);
+          if (!existingUser) return new Error("User Not Found");
+          //@ts-ignore
+          existingUser.blogs.push(blog);
+          await existingUser.save({ session });
+          return await blog.save({ session });
         } catch (error) {
           return new Error(error);
+        } finally {
+          await session.commitTransaction();
         }
       },
     },
@@ -141,15 +151,94 @@ const mutations = new GraphQLObjectType({
       },
       async resolve(parent, { id }) {
         let existingBlog: Document<any, any, any>;
+        const session = await startSession();
         try {
-          existingBlog = await Blog.findById(id);
+          session.startTransaction({session});
+          existingBlog = await Blog.findById(id).populate("user");
           if (!existingBlog) return new Error("Blog does not exist");
-          return Blog.findByIdAndDelete(id);
+          //@ts-ignore
+          const existingUser = existingBlog.user;
+          if(!existingUser) return new Error("No user found");
+          existingUser.blogs.pull(existingBlog);
+          await existingUser.save({session})
+          return existingBlog.deleteOne({id: existingBlog.id});
         } catch (error) {
           return new Error(error);
+        } finally {
+          session.commitTransaction();
         }
       },
     },
+    // add comment to a blog
+    addCommentToBlog: {
+      type: CommentType,
+      args: {
+        blog: {type: GraphQLNonNull(GraphQLID)},
+        user: {type: GraphQLNonNull(GraphQLID)},
+        text: {type: GraphQLNonNull(GraphQLString)},
+        date: {type: GraphQLNonNull(GraphQLString)},
+      },
+      async resolve(parent, {user, blog, text, date}) {
+        const session = await startSession();
+        let comment: Document<any,any,any>;
+        try {
+          session.startTransaction({session});
+          const existingUser = await User.findById(user);
+          const existingBlog = await Blog.findById(blog);
+          if (!existingUser || !existingBlog)
+            return new Error("User or Blog Does not exist");
+          comment = new Comment({
+            text,
+            date,
+            blog,
+            user,
+          });
+          //@ts-ignore
+          existingUser.comments.push(comment);
+          //@ts-ignore
+          existingBlog.comments.push(comment);
+          await existingBlog.save({session});
+          await existingUser.save({session});
+          return await comment.save({session});
+        } catch (error) {
+          return new Error(error);
+        } finally{
+          session.commitTransaction();
+        }
+      }
+    },
+    // delete a comment from a blog
+    deleteComment: {
+      type: CommentType,
+      args: {
+        id: {type: GraphQLNonNull(GraphQLID)}
+      },
+      async resolve(parent, {id}) {
+        let comment: any;
+        const session = await startSession();
+        try {
+          session.startTransaction({session});
+          comment = await Comment.findById(id);
+          if (!comment) return new Error("Comment not Found");
+          //@ts-ignore
+          const existingUser = await User.findById(comment?.user);
+          if (!existingUser) return new Error("User not Found");
+          //@ts-ignore
+          const existingBlog = await Blog.findById(comment?.blog);
+          if(!existingBlog) return new Error("Blog not found");
+          existingUser.comments.pull(comment);
+          existingBlog.comments.pull(comment);
+          await existingUser.save({session});
+          await existingBlog.save({session});
+          return await comment.deleteOne({id: comment.id});
+
+        } catch (error) {
+          return new Error(error);
+        } finally{
+          await session.commitTransaction();
+        }
+      }
+    }
   },
 });
 
